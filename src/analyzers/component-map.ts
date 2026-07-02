@@ -1,0 +1,484 @@
+import {
+  Project,
+  Node,
+  SyntaxKind,
+  CallExpression,
+  SourceFile,
+} from 'ts-morph';
+import path from 'path';
+import { GraphQLOperation, GraphQLFragment, HookUsage, Library } from '../types';
+import { DocBinding } from '../parsers/graphql-files';
+
+/** Hooks/functions that execute a GraphQL document, and the client they belong to. */
+const APOLLO_HOOKS = new Set([
+  'useQuery',
+  'useLazyQuery',
+  'useSuspenseQuery',
+  'useBackgroundQuery',
+  'useReadQuery',
+  'useMutation',
+  'useSubscription',
+  'useFragment',
+]);
+const URQL_HOOKS = new Set(['useQuery', 'useMutation', 'useSubscription']);
+const REQUEST_FNS = new Set(['request', 'rawRequest']);
+const RELAY_HOOKS = new Set(['useLazyLoadQuery', 'usePreloadedQuery', 'useFragment']);
+
+/** Iteration methods whose callback's element param aliases a list element. */
+const CB_ELEMENT_METHODS = new Set([
+  'map',
+  'forEach',
+  'filter',
+  'flatMap',
+  'find',
+  'findIndex',
+  'some',
+  'every',
+  'sort',
+]);
+/** reduce/reduceRight: element is the callback's *second* param (after the accumulator). */
+const REDUCE_METHODS = new Set(['reduce', 'reduceRight']);
+/**
+ * Methods whose result keeps the same element shape as the source list. When
+ * the chain flows through one of these we keep walking with the same path, so a
+ * `.filter(...)` result that's re-aliased or passed to a child is still tracked.
+ */
+const SHAPE_PRESERVING = new Set(['filter', 'slice', 'sort', 'reverse', 'concat', 'flat', 'find']);
+
+/** Option keys whose function value receives the query result as its first param. */
+const RESULT_CALLBACKS = new Set(['onCompleted', 'onData']);
+
+interface Alias {
+  ident: string;
+  /** Response-key path this identifier is rooted at ('' = operation root). */
+  base: string;
+  /** Scope to search for references (defaults to the enclosing function). */
+  scope: Node;
+  /** When true, skip a leading `.data` segment (identifier holds the whole hook result). */
+  viaData?: boolean;
+}
+
+/** Resolution indexes built once from the parsed model. */
+export function buildResolvers(
+  operations: GraphQLOperation[],
+  fragments: GraphQLFragment[],
+  bindings: DocBinding[]
+) {
+  const opByVar = new Map<string, GraphQLOperation>();
+  const opByName = new Map<string, GraphQLOperation>();
+  const fragByVar = new Map<string, GraphQLFragment>();
+  const fragByName = new Map<string, GraphQLFragment>();
+
+  for (const op of operations) {
+    if (op.varName) opByVar.set(op.varName, op);
+    if (op.name) opByName.set(op.name.toLowerCase(), op);
+  }
+  for (const f of fragments) {
+    if (f.varName) fragByVar.set(f.varName, f);
+    fragByName.set(f.name.toLowerCase(), f);
+  }
+  // Bindings help when a var holds an anonymous operation (no op name).
+  for (const b of bindings) {
+    if (b.primaryName && b.kind === 'operation') {
+      const op = opByName.get(b.primaryName.toLowerCase());
+      if (op && !opByVar.has(b.varName)) opByVar.set(b.varName, op);
+    }
+  }
+
+  const resolveOp = (identifier: string | null): GraphQLOperation | null => {
+    if (!identifier) return null;
+    if (opByVar.has(identifier)) return opByVar.get(identifier)!;
+    // Codegen convention: `FooDocument` → operation `Foo`.
+    if (identifier.endsWith('Document')) {
+      const base = identifier.slice(0, -'Document'.length);
+      const hit = opByName.get(base.toLowerCase());
+      if (hit) return hit;
+    }
+    return opByName.get(identifier.toLowerCase()) ?? null;
+  };
+
+  const resolveFrag = (identifier: string | null): GraphQLFragment | null => {
+    if (!identifier) return null;
+    if (fragByVar.has(identifier)) return fragByVar.get(identifier)!;
+    if (identifier.endsWith('FragmentDoc')) {
+      const base = identifier.slice(0, -'FragmentDoc'.length);
+      const hit = fragByName.get(base.toLowerCase());
+      if (hit) return hit;
+    }
+    return fragByName.get(identifier.toLowerCase()) ?? null;
+  };
+
+  return { resolveOp, resolveFrag, opByName };
+}
+
+/** Classify a call as a GraphQL execution and return its library + doc argument. */
+function classifyCall(
+  call: CallExpression
+): { library: Library; hook: string; docArg: Node | null; generatedName: string | null } | null {
+  const callee = call.getExpression();
+  const hook = Node.isPropertyAccessExpression(callee)
+    ? callee.getName()
+    : callee.getText();
+  const args = call.getArguments();
+
+  // Codegen-generated hooks embed the document: use<Name>Query / ...Mutation / etc.
+  const gen = /^use([A-Z]\w*?)(LazyQuery|SuspenseQuery|Query|Mutation|Subscription)$/.exec(
+    hook
+  );
+  if (gen && !APOLLO_HOOKS.has(hook) && !URQL_HOOKS.has(hook)) {
+    return { library: 'codegen', hook, docArg: null, generatedName: gen[1] };
+  }
+
+  if (APOLLO_HOOKS.has(hook)) {
+    return { library: 'apollo', hook, docArg: args[0] ?? null, generatedName: null };
+  }
+  if (RELAY_HOOKS.has(hook)) {
+    return { library: 'relay', hook, docArg: args[0] ?? null, generatedName: null };
+  }
+  if (URQL_HOOKS.has(hook)) {
+    // urql useQuery({ query: DOC }); useMutation(DOC)
+    let docArg: Node | null = args[0] ?? null;
+    if (docArg && Node.isObjectLiteralExpression(docArg)) {
+      const prop =
+        docArg.getProperty('query') ?? docArg.getProperty('mutation');
+      docArg =
+        prop && Node.isPropertyAssignment(prop) ? prop.getInitializer() ?? null : null;
+    }
+    return { library: 'urql', hook, docArg, generatedName: null };
+  }
+  if (REQUEST_FNS.has(hook)) {
+    // graphql-request: request(url, DOC, variables)
+    return { library: 'graphql-request', hook, docArg: args[1] ?? null, generatedName: null };
+  }
+  return null;
+}
+
+/** Nearest enclosing named function/component, else `<basename>`. */
+function enclosingComponent(node: Node, file: string): string {
+  let cur: Node | undefined = node;
+  while (cur) {
+    if (Node.isFunctionDeclaration(cur) && cur.getName()) return cur.getName()!;
+    if (
+      (Node.isArrowFunction(cur) || Node.isFunctionExpression(cur)) &&
+      Node.isVariableDeclaration(cur.getParent())
+    ) {
+      return (cur.getParent() as any).getName();
+    }
+    if (Node.isMethodDeclaration(cur)) return cur.getName();
+    cur = cur.getParent();
+  }
+  return `<${path.basename(file)}>`;
+}
+
+/** Extract the document identifier text from the hook's doc argument. */
+function docIdentifier(docArg: Node | null): string | null {
+  if (!docArg) return null;
+  if (Node.isIdentifier(docArg)) return docArg.getText();
+  // Tolerate `SomeDocument as DocumentNode` etc.
+  if (Node.isAsExpression(docArg) && Node.isIdentifier(docArg.getExpression())) {
+    return docArg.getExpression().getText();
+  }
+  return null;
+}
+
+/** From a hook call, figure out the identifiers that hold the result data. */
+function resultAliases(call: CallExpression, library: Library, hook: string, scope: Node): Alias[] {
+  const aliases: Alias[] = [];
+  const decl = call.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+  const nameNode = decl?.getNameNode();
+
+  const pushObjData = (objPattern: Node) => {
+    if (!Node.isObjectBindingPattern(objPattern)) return;
+    for (const el of objPattern.getElements()) {
+      const prop = el.getPropertyNameNode()?.getText() ?? el.getName();
+      if (prop === 'data') aliases.push({ ident: el.getName(), base: '', scope });
+    }
+  };
+
+  if (nameNode) {
+    if (Node.isObjectBindingPattern(nameNode)) {
+      // Apollo: const { data } = useQuery(...)  /  const { data: alias } = ...
+      pushObjData(nameNode);
+    } else if (Node.isArrayBindingPattern(nameNode)) {
+      const els = nameNode.getElements();
+      if (library === 'urql') {
+        // const [{ data }] = useQuery(...)
+        const first = els[0];
+        if (first && Node.isBindingElement(first)) pushObjData(first.getNameNode());
+      } else {
+        // Apollo mutation: const [mutate, { data }] = useMutation(...)
+        const second = els[1];
+        if (second && Node.isBindingElement(second)) pushObjData(second.getNameNode());
+      }
+    } else if (Node.isIdentifier(nameNode)) {
+      if (hook === 'useFragment' || library === 'relay') {
+        // useFragment returns the data object directly.
+        aliases.push({ ident: nameNode.getText(), base: '', scope });
+      } else {
+        // const result = useQuery(...)  → result.data.<field>
+        aliases.push({ ident: nameNode.getText(), base: '', scope, viaData: true });
+      }
+    }
+  }
+
+  // onCompleted / onData callbacks receive the result as their first param.
+  const optsArg = call.getArguments().find((a) => Node.isObjectLiteralExpression(a));
+  if (optsArg && Node.isObjectLiteralExpression(optsArg)) {
+    for (const prop of optsArg.getProperties()) {
+      if (!Node.isPropertyAssignment(prop) && !Node.isMethodDeclaration(prop)) continue;
+      const key = (prop as any).getName?.();
+      if (!RESULT_CALLBACKS.has(key)) continue;
+      const fn = Node.isPropertyAssignment(prop) ? prop.getInitializer() : prop;
+      if (fn && (Node.isArrowFunction(fn) || Node.isFunctionExpression(fn) || Node.isMethodDeclaration(fn))) {
+        const p0 = (fn as any).getParameters?.()[0];
+        const body = (fn as any).getBody?.() ?? fn;
+        if (p0 && Node.isIdentifier(p0.getNameNode())) {
+          aliases.push({ ident: p0.getName(), base: '', scope: body });
+        }
+      }
+    }
+  }
+
+  return aliases;
+}
+
+/** Bind an iteration callback's element param(s) as aliases rooted at `base`. */
+function bindCallbackParams(
+  call: CallExpression,
+  base: string,
+  method: string,
+  queue: Alias[]
+): void {
+  const cb = call.getArguments()[0];
+  if (!cb || !(Node.isArrowFunction(cb) || Node.isFunctionExpression(cb))) return;
+  const body = cb.getBody();
+  const params = cb.getParameters();
+  const elementParams = REDUCE_METHODS.has(method)
+    ? [params[1]]
+    : method === 'sort'
+    ? [params[0], params[1]]
+    : [params[0]];
+
+  for (const p of elementParams) {
+    if (!p) continue;
+    const pn = p.getNameNode();
+    if (Node.isIdentifier(pn)) {
+      queue.push({ ident: pn.getText(), base, scope: body });
+    } else if (Node.isObjectBindingPattern(pn)) {
+      for (const el of pn.getElements()) {
+        const prop = el.getPropertyNameNode()?.getText() ?? el.getName();
+        queue.push({ ident: el.getName(), base: base ? `${base}.${prop}` : prop, scope: body });
+      }
+    }
+  }
+}
+
+const WHOLE_OBJECT_PARENTS = new Set([
+  SyntaxKind.JsxExpression,
+  SyntaxKind.CallExpression,
+  SyntaxKind.SpreadAssignment,
+  SyntaxKind.SpreadElement,
+  SyntaxKind.ReturnStatement,
+  SyntaxKind.ArrayLiteralExpression,
+  SyntaxKind.PropertyAssignment,
+  SyntaxKind.JsxSpreadAttribute,
+]);
+
+/**
+ * Walk every reference to `alias.ident` within its scope, following member
+ * chains, iteration callbacks, and re-aliasing, recording which response-key
+ * paths are read (`accessed`) and which subtrees are handed off whole
+ * (`passthrough`).
+ */
+function collectAccesses(
+  alias: Alias,
+  accessed: Set<string>,
+  passthrough: Set<string>,
+  queue: Alias[]
+): void {
+  const refs = alias.scope
+    .getDescendantsOfKind(SyntaxKind.Identifier)
+    .filter((id) => id.getText() === alias.ident);
+
+  for (const ref of refs) {
+    // Skip the declaration site itself.
+    const p = ref.getParent();
+    if (
+      p &&
+      (Node.isVariableDeclaration(p) ||
+        Node.isBindingElement(p) ||
+        Node.isParameterDeclaration(p) ||
+        Node.isPropertyAssignment(p))
+    ) {
+      // Only skip when the identifier is the *name* being declared.
+      const nameNode = (p as any).getNameNode?.();
+      if (nameNode === ref) continue;
+    }
+
+    let cur: Node = ref;
+    let curPath = alias.base;
+    let sawData = !alias.viaData;
+
+    // Walk up the member-access / index chain.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const parent = cur.getParent();
+      if (!parent) break;
+
+      if (Node.isPropertyAccessExpression(parent) && parent.getExpression() === cur) {
+        const name = parent.getName();
+        const gp = parent.getParent();
+        const isMethodCall =
+          gp && Node.isCallExpression(gp) && gp.getExpression() === parent;
+
+        if (isMethodCall) {
+          const call = gp as CallExpression;
+          if (CB_ELEMENT_METHODS.has(name) || REDUCE_METHODS.has(name)) {
+            bindCallbackParams(call, curPath, name, queue);
+          }
+          if (curPath) accessed.add(curPath);
+          if (SHAPE_PRESERVING.has(name)) {
+            // e.g. list.filter(...) → keep walking; result carries the same element shape.
+            cur = call;
+            continue;
+          }
+          break;
+        }
+
+        // Plain field access — extend the path (skip the leading `.data`).
+        if (!sawData) {
+          if (name === 'data') {
+            sawData = true;
+            cur = parent;
+            continue;
+          }
+          break; // result.loading etc. — not part of the data tree
+        }
+        curPath = curPath ? `${curPath}.${name}` : name;
+        cur = parent;
+        continue;
+      }
+
+      if (Node.isElementAccessExpression(parent) && parent.getExpression() === cur) {
+        cur = parent; // list[0] — index into a list, path unchanged
+        continue;
+      }
+      if (
+        Node.isNonNullExpression(parent) ||
+        Node.isParenthesizedExpression(parent) ||
+        Node.isAsExpression(parent)
+      ) {
+        cur = parent;
+        continue;
+      }
+      // `a || b`, `a ?? b`, `a && b`, and ternary branches are transparent —
+      // the chain result flows through them (e.g. `x?.items?.filter() || []`).
+      if (Node.isBinaryExpression(parent)) {
+        const op = parent.getOperatorToken().getText();
+        if ((op === '||' || op === '??' || op === '&&') &&
+          (parent.getLeft() === cur || parent.getRight() === cur)) {
+          cur = parent;
+          continue;
+        }
+      }
+      if (
+        Node.isConditionalExpression(parent) &&
+        (parent.getWhenTrue() === cur || parent.getWhenFalse() === cur)
+      ) {
+        cur = parent;
+        continue;
+      }
+      break;
+    }
+
+    if (!sawData) continue; // never reached the data tree (e.g. `result.loading`)
+
+    // How is the chain endpoint consumed?
+    const endParent = cur.getParent();
+
+    // const x = <chain>  → re-alias
+    if (endParent && Node.isVariableDeclaration(endParent) && endParent.getInitializer() === cur) {
+      const bn = endParent.getNameNode();
+      if (Node.isIdentifier(bn)) {
+        queue.push({ ident: bn.getText(), base: curPath, scope: alias.scope });
+      } else if (Node.isObjectBindingPattern(bn)) {
+        for (const el of bn.getElements()) {
+          const prop = el.getPropertyNameNode()?.getText() ?? el.getName();
+          queue.push({
+            ident: el.getName(),
+            base: curPath ? `${curPath}.${prop}` : prop,
+            scope: alias.scope,
+          });
+        }
+      }
+      if (curPath) accessed.add(curPath);
+      continue;
+    }
+
+    if (curPath) {
+      accessed.add(curPath);
+      // Handed off as a whole object → treat its whole subtree as used.
+      if (endParent && WHOLE_OBJECT_PARENTS.has(endParent.getKind())) {
+        passthrough.add(curPath);
+      }
+    }
+  }
+}
+
+/** Build the operation/fragment → component usage map for the whole project. */
+export function mapComponents(
+  project: Project,
+  operations: GraphQLOperation[],
+  fragments: GraphQLFragment[],
+  bindings: DocBinding[]
+): HookUsage[] {
+  const { resolveOp, resolveFrag } = buildResolvers(operations, fragments, bindings);
+  const usages: HookUsage[] = [];
+
+  for (const sf of project.getSourceFiles()) {
+    const file = sf.getFilePath();
+    for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const classified = classifyCall(call);
+      if (!classified) continue;
+      const { library, hook, docArg, generatedName } = classified;
+
+      const identifier = generatedName ?? docIdentifier(docArg);
+      const isFragmentHook = hook === 'useFragment';
+      const op = isFragmentHook ? null : resolveOp(generatedName ?? docIdentifier(docArg));
+      const frag = isFragmentHook ? resolveFrag(docIdentifier(docArg)) : null;
+
+      const operationName = op?.name ?? frag?.name ?? generatedName ?? identifier ?? null;
+
+      const scope: Node =
+        call.getFirstAncestorByKind(SyntaxKind.Block) ??
+        call.getFirstAncestorByKind(SyntaxKind.ArrowFunction) ??
+        sf;
+
+      const accessed = new Set<string>();
+      const passthrough = new Set<string>();
+      const queue = resultAliases(call, library, hook, scope);
+      const guard = new Set<string>();
+      while (queue.length) {
+        const a = queue.shift()!;
+        const key = `${a.ident}|${a.base}`;
+        if (guard.has(key)) continue;
+        guard.add(key);
+        collectAccesses(a, accessed, passthrough, queue);
+      }
+
+      usages.push({
+        hook,
+        library,
+        operationName,
+        documentIdentifier: identifier,
+        component: enclosingComponent(call, file),
+        file,
+        line: call.getStartLineNumber(),
+        accessedPaths: Array.from(accessed),
+        passthroughPaths: Array.from(passthrough),
+      });
+    }
+  }
+
+  return usages;
+}

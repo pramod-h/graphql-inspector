@@ -1,0 +1,56 @@
+{
+  "name": "@codilar/graphql-inspector",
+  "version": "0.1.0",
+  "description": "Understand how your frontend actually uses GraphQL — dead queries, duplicates, complexity, schema drift, and overfetch analysis across GraphQL ↔ hooks ↔ React components.",
+  "keywords": [
+    "graphql",
+    "overfetch",
+    "static-analysis",
+    "apollo",
+    "urql",
+    "relay",
+    "codegen",
+    "react",
+    "cli",
+    "dead-code"
+  ],
+  "license": "MIT",
+  "author": "Codilar",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "graphql-inspector": "dist/cli.js",
+    "gqi": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^12.1.0",
+    "fast-glob": "^3.3.2",
+    "graphql": "^16.9.0",
+    "ora": "^5.4.1",
+    "ts-morph": "^23.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}

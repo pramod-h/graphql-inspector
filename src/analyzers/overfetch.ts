@@ -1,0 +1,114 @@
+import {
+  Confidence,
+  GraphQLFragment,
+  GraphQLOperation,
+  HookUsage,
+  OverfetchFinding,
+} from '../types';
+import { DocBinding } from '../parsers/graphql-files';
+import { buildResolvers } from './component-map';
+
+/** True if `leaf` is covered by any pass-through (whole-object) ancestor. */
+function passthroughCovers(leaf: string, passthrough: Set<string>): boolean {
+  for (const p of passthrough) {
+    if (leaf === p || leaf.startsWith(p + '.')) return true;
+  }
+  return false;
+}
+
+/** True if any accessed/passthrough path touches the subtree rooted at `top`. */
+function subtreeTouched(top: string, sets: Set<string>[]): boolean {
+  for (const set of sets) {
+    for (const a of set) {
+      if (a === top || a.startsWith(top + '.')) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The differentiating analysis: compare each query's requested fields against
+ * the fields actually read in the components that run it, and report the fields
+ * that are fetched but never used.
+ *
+ * Precision-biased: if we captured no field reads at all for an operation (e.g.
+ * the result is only returned from a custom hook we don't follow), we skip it
+ * rather than claim everything is unused.
+ */
+export function analyzeOverfetch(
+  operations: GraphQLOperation[],
+  fragments: GraphQLFragment[],
+  usages: HookUsage[],
+  bindings: DocBinding[]
+): OverfetchFinding[] {
+  const { resolveOp } = buildResolvers(operations, fragments, bindings);
+
+  // Group usages by the operation they resolve to.
+  const byOp = new Map<GraphQLOperation, HookUsage[]>();
+  for (const u of usages) {
+    const op = resolveOp(u.documentIdentifier ?? u.operationName);
+    if (!op) continue;
+    if (!byOp.has(op)) byOp.set(op, []);
+    byOp.get(op)!.push(u);
+  }
+
+  const findings: OverfetchFinding[] = [];
+
+  for (const op of operations) {
+    if (op.operation !== 'query') continue; // queries only — mutations rarely render their result
+    const opUsages = byOp.get(op) ?? [];
+    if (opUsages.length === 0) continue; // no consumer → dead-query territory, not overfetch
+
+    const accessed = new Set<string>();
+    const passthrough = new Set<string>();
+    for (const u of opUsages) {
+      u.accessedPaths.forEach((p) => accessed.add(p));
+      u.passthroughPaths.forEach((p) => passthrough.add(p));
+    }
+    if (accessed.size === 0 && passthrough.size === 0) continue; // not analyzable
+
+    const leaves = op.leafPaths;
+    if (leaves.length === 0) continue;
+
+    const topLevel = Array.from(new Set(op.fields.map((f) => f.responseKey)));
+    const unused: { path: string; confidence: Confidence }[] = [];
+    let unusedLeafCount = 0;
+    const reportedBranches = new Set<string>();
+
+    // 1) Whole top-level branches never touched → high-confidence overfetch.
+    for (const top of topLevel) {
+      if (!subtreeTouched(top, [accessed, passthrough])) {
+        unused.push({ path: top, confidence: 'high' });
+        reportedBranches.add(top);
+        unusedLeafCount += leaves.filter(
+          (l) => l === top || l.startsWith(top + '.')
+        ).length;
+      }
+    }
+
+    // 2) Individual unused leaves inside branches we DO otherwise use.
+    for (const leaf of leaves) {
+      const top = leaf.split('.')[0];
+      if (reportedBranches.has(top)) continue;
+      const covered = accessed.has(leaf) || passthroughCovers(leaf, passthrough);
+      if (!covered) {
+        unused.push({ path: leaf, confidence: 'medium' });
+        unusedLeafCount++;
+      }
+    }
+
+    if (unused.length === 0) continue;
+
+    findings.push({
+      operation: op.name ?? op.varName ?? '(anonymous query)',
+      file: op.loc.file,
+      line: op.loc.line,
+      requestedCount: leaves.length,
+      usedCount: leaves.length - unusedLeafCount,
+      unused: unused.sort((a, b) => a.path.localeCompare(b.path)),
+      estimatedReductionPct: Math.round((unusedLeafCount / leaves.length) * 100),
+    });
+  }
+
+  return findings.sort((a, b) => b.estimatedReductionPct - a.estimatedReductionPct);
+}
