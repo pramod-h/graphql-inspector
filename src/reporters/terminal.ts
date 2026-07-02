@@ -145,6 +145,37 @@ export function printSchemaDrift(a: AnalysisResult): void {
   }
 }
 
+export function printGeneratedTypes(a: AnalysisResult): void {
+  heading('Generated type usage');
+  const g = a.generatedTypes;
+  if (!g || !g.found) {
+    line(
+      c.dim(
+        '  No GraphQL Code Generator output found.\n' +
+          '  Point at it with --generated "<glob>" (e.g. --generated "src/**/*.generated.ts").'
+      )
+    );
+    return;
+  }
+  kv('  Generated files', g.generatedFiles);
+  kv('  Generated types', g.total);
+  kv('  Used', `${c.green(String(g.used))} ${c.dim(`(${g.usagePct}%)`)}`);
+  kv('  Unused', g.unused.length ? c.yellow(String(g.unused.length)) : c.green('0'));
+  if (g.unused.length) {
+    line(c.dim('\n  Unused generated types:'));
+    for (const t of g.unused.slice(0, 40)) {
+      line(`    ${c.yellow('-')} ${t.name} ${c.dim(rel(a.project.root, t.file) + ':' + t.line)}`);
+    }
+    if (g.unused.length > 40) line(c.dim(`    …and ${g.unused.length - 40} more`));
+    line(
+      c.dim(
+        '\n  "Used" = reachable from app-code references (incl. via query types /\n' +
+          '  Document consts). Confirm before deleting — re-exports may hide usage.'
+      )
+    );
+  }
+}
+
 export function printUnusedVariables(a: AnalysisResult): void {
   const withUnused = a.operations.filter((o) => o.unusedVariables.length);
   if (!withUnused.length) return;
@@ -168,6 +199,7 @@ export function printFull(a: AnalysisResult, details: boolean): void {
     printComplexity(a);
     printSchemaDrift(a);
     printUnusedVariables(a);
+    if (a.generatedTypes) printGeneratedTypes(a);
   } else {
     line(c.dim('\nRun with --details, or a subcommand (overfetch, unused, complexity, …) for specifics.'));
   }

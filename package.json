@@ -1,6 +1,6 @@
 {
   "name": "@codilar/graphql-inspector",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Understand how your frontend actually uses GraphQL — dead queries, duplicates, complexity, schema drift, and overfetch analysis across GraphQL ↔ hooks ↔ React components.",
   "keywords": [
     "graphql",

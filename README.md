@@ -31,11 +31,12 @@ graphql-inspector unused [path]          # dead queries + fragments + variables
 graphql-inspector complexity [path]      # depth / field-count risk
 graphql-inspector duplicates [path]      # identical & near-identical docs
 graphql-inspector impact <Type.field>    # affected operations/fragments/components
-graphql-inspector types                  # (roadmap) generated-type usage
+graphql-inspector types [path]           # unused GraphQL Code Generator types
 ```
 
 Flags: `--json` (machine-readable), `--schema <path>` (SDL or introspection JSON,
-enables schema-drift), `--ignore <globs...>`.
+enables schema-drift), `--ignore <globs...>`. `types` also takes
+`--generated <globs...>` to point at codegen output when auto-detection misses it.
 
 ## What it understands
 
@@ -76,12 +77,19 @@ crying wolf — but be aware:
 - **Overfetch** doesn't follow reads across module boundaries or through custom
   hooks that return `data` (Venia "talons", etc.). It treats data returned/passed
   onward as *used*, so those show as fully used rather than false overfetch.
-- **Dead queries / fragments** are based on what this tool can resolve. A
-  document consumed only via a custom wrapper hook, or a fragment used only by a
-  fragment defined in `node_modules` / another package, may be reported as dead.
-  Confirm before deleting.
+- **Dead queries** are detected by whether the document's identifier is
+  referenced anywhere as a value (hook call, wrapper hook, operations-map,
+  named import, generated hook). This handles custom-hook indirection and
+  duplicate definitions, and is precision-biased — it won't call a query dead
+  just because the exact hook couldn't be traced (so it may under-report).
+- **Dead fragments** use spread-reachability from operations. A fragment spread
+  only by a fragment defined in `node_modules` / another package can still show
+  as dead — confirm before deleting.
 - **Schema drift** requires an accurate, current schema (`--schema`). A stale or
   partial snapshot will produce noise.
+- **Generated type usage** counts a type as used if it's reachable from app-code
+  imports/type-references (following references between generated types). Types
+  reached only via `export *` barrels or dynamic access may show as unused.
 
 ## Programmatic use
 
@@ -93,7 +101,6 @@ console.log(analysis.overfetch);
 
 ## Roadmap
 
-- `types`: unused generated types + response-field usage (Phase 7).
 - HTML report (`--html`), GitHub Action, and Claude integration.
 
 ## Development

@@ -136,6 +136,18 @@ export interface ProjectInfo {
   schemaPath: string | null;
 }
 
+export interface GeneratedTypesReport {
+  /** False when no GraphQL Code Generator output could be located. */
+  found: boolean;
+  generatedFiles: number;
+  /** Total exported type declarations (excluding codegen plumbing helpers). */
+  total: number;
+  /** Reachable from application-code references (directly or transitively). */
+  used: number;
+  unused: { name: string; file: string; line: number }[];
+  usagePct: number;
+}
+
 export interface AnalysisResult {
   project: ProjectInfo;
   operations: GraphQLOperation[];
@@ -149,6 +161,8 @@ export interface AnalysisResult {
   overfetch: OverfetchFinding[];
   schemaDrift: SchemaDriftFinding[];
   schemaLoaded: boolean;
+  /** Populated only by the `types` command (opt-in via ScanOptions.analyzeTypes). */
+  generatedTypes: GeneratedTypesReport | null;
   /** Files scanned counts, for the summary header. */
   stats: {
     graphqlFiles: number;
@@ -163,4 +177,8 @@ export interface ScanOptions {
   ignore?: string[];
   /** Explicit schema path override. */
   schema?: string | null;
+  /** Run the (more expensive) generated-type usage analysis. */
+  analyzeTypes?: boolean;
+  /** Explicit globs for generated files, overriding auto-detection. */
+  generated?: string[];
 }

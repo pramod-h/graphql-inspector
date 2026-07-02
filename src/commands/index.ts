@@ -4,11 +4,13 @@ import { toJson } from '../reporters/json';
 import * as term from '../reporters/terminal';
 import { c, line, setQuiet, heading } from '../utils/logger';
 import { ScanOptions } from '../types';
+import { analyzeImpact } from '../analyzers/impact';
 
 export interface CommonOpts {
   json?: boolean;
   schema?: string;
   ignore?: string[];
+  generated?: string[];
 }
 
 function optionsFrom(pathArg: string | undefined, opts: CommonOpts): ScanOptions {
@@ -16,6 +18,7 @@ function optionsFrom(pathArg: string | undefined, opts: CommonOpts): ScanOptions
     cwd: path.resolve(pathArg ?? process.cwd()),
     schema: opts.schema ?? null,
     ignore: opts.ignore,
+    generated: opts.generated,
   };
 }
 
@@ -94,27 +97,16 @@ export function impactCommand(
   opts: CommonOpts
 ): void {
   const { analysis } = run(pathArg, opts);
-  const field = target.includes('.') ? target.split('.').pop()! : target;
-  const lc = field.toLowerCase();
-
-  const matchDoc = (paths: string[]) =>
-    paths.some((p) => p.split('.').some((seg) => seg.toLowerCase() === lc));
-
-  const affectedOps = analysis.operations.filter((o) => matchDoc(o.allPaths));
-  const affectedFrags = analysis.fragments.filter((f) => matchDoc(f.allPaths));
-  const opNames = new Set(affectedOps.map((o) => (o.name ?? o.varName)?.toLowerCase()));
-  const affectedComponents = analysis.usages.filter((u) =>
-    opNames.has((u.operationName ?? '').toLowerCase())
-  );
+  const result = analyzeImpact(analysis.operations, analysis.fragments, analysis.usages, target);
 
   if (opts.json) {
     return console.log(
       JSON.stringify(
         {
-          target,
-          affectedOperations: affectedOps.map((o) => o.name ?? o.varName),
-          affectedFragments: affectedFrags.map((f) => f.name),
-          affectedComponents: Array.from(new Set(affectedComponents.map((u) => u.component))),
+          target: result.target,
+          affectedOperations: result.operations,
+          affectedFragments: result.fragments,
+          affectedComponents: result.components,
         },
         null,
         2
@@ -123,24 +115,17 @@ export function impactCommand(
   }
 
   heading(`Impact of "${target}"`);
-  line(`  Affected operations: ${c.bold(String(affectedOps.length))}`);
-  line(`  Affected fragments:  ${c.bold(String(affectedFrags.length))}`);
-  line(
-    `  Affected components: ${c.bold(
-      String(new Set(affectedComponents.map((u) => u.component)).size)
-    )}`
-  );
-  for (const o of affectedOps.slice(0, 30)) {
-    line(`    · ${o.name ?? o.varName} ${c.dim('(' + o.operation + ')')}`);
+  line(`  Affected operations: ${c.bold(String(result.operations.length))}`);
+  line(`  Affected fragments:  ${c.bold(String(result.fragments.length))}`);
+  line(`  Affected components: ${c.bold(String(result.components.length))}`);
+  for (const name of result.operations.slice(0, 30)) {
+    line(`    · ${name}`);
   }
 }
 
-export function typesCommand(): void {
-  heading('Generated type usage');
-  line(
-    c.dim(
-      '  Not implemented in v0.1. Planned: cross-reference GraphQL Code Generator\n' +
-        '  output (unused generated types / response-field usage). Tracked in the roadmap.'
-    )
-  );
+export function typesCommand(pathArg: string | undefined, opts: CommonOpts): void {
+  setQuiet(!!opts.json);
+  const { analysis } = scan({ ...optionsFrom(pathArg, opts), analyzeTypes: true });
+  if (opts.json) return console.log(JSON.stringify(analysis.generatedTypes, null, 2));
+  term.printGeneratedTypes(analysis);
 }

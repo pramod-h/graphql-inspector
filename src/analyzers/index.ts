@@ -20,19 +20,22 @@ export interface AnalyzeInput {
   fragments: GraphQLFragment[];
   usages: HookUsage[];
   bindings: DocBinding[];
+  /** Identifiers referenced as values anywhere in the project (for dead-query detection). */
+  referencedNames: Set<string>;
   schema: GraphQLSchema | null;
   stats: AnalysisResult['stats'];
 }
 
 /** Run every analyzer and assemble the full result. */
 export function runAnalysis(input: AnalyzeInput): AnalysisResult {
-  const { project, operations, fragments, usages, bindings, schema, stats } = input;
+  const { project, operations, fragments, usages, bindings, referencedNames, schema, stats } =
+    input;
   return {
     project,
     operations,
     fragments,
     usages,
-    deadQueries: findDeadQueries(operations, fragments, usages, bindings),
+    deadQueries: findDeadQueries(operations, referencedNames),
     deadFragments: findDeadFragments(operations, fragments),
     duplicateQueries: findDuplicates(operations),
     duplicateFragments: findDuplicates(fragments),
@@ -40,6 +43,7 @@ export function runAnalysis(input: AnalyzeInput): AnalysisResult {
     overfetch: analyzeOverfetch(operations, fragments, usages, bindings),
     schemaDrift: analyzeSchemaDrift(schema, operations, fragments),
     schemaLoaded: !!schema,
+    generatedTypes: null,
     stats,
   };
 }

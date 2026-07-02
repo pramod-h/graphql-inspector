@@ -1,22 +1,23 @@
-import { GraphQLFragment, GraphQLOperation, HookUsage } from '../types';
-import { DocBinding } from '../parsers/graphql-files';
-import { buildResolvers } from './component-map';
+import { GraphQLOperation } from '../types';
 
 /**
- * Operations that no component ever executes. We resolve every hook usage back
- * to an operation and report the operations left with zero consumers.
+ * Operations no code references. An operation is considered *alive* if any of
+ * its document identifiers — the `gql` const name, the operation name, the
+ * codegen `<Name>Document`, or a generated `use<Name>Query` hook — is
+ * referenced as a value anywhere in the project (see `collectReferencedNames`).
+ *
+ * This is precision-biased on purpose: it won't flag a query as dead just
+ * because we couldn't trace which hook runs it (custom wrapper hooks, Venia
+ * operations-map indirection, duplicate definitions sharing a name). The cost
+ * is missing some genuinely-dead queries; the benefit is not telling you to
+ * delete live code.
  */
 export function findDeadQueries(
   operations: GraphQLOperation[],
-  fragments: GraphQLFragment[],
-  usages: HookUsage[],
-  bindings: DocBinding[]
+  referencedNames: Set<string>
 ): GraphQLOperation[] {
-  const { resolveOp } = buildResolvers(operations, fragments, bindings);
-  const used = new Set<GraphQLOperation>();
-  for (const u of usages) {
-    const op = resolveOp(u.documentIdentifier ?? u.operationName);
-    if (op) used.add(op);
-  }
-  return operations.filter((op) => !used.has(op));
+  return operations.filter((op) => {
+    const ids = [op.varName, op.name, op.name ? `${op.name}Document` : null];
+    return !ids.some((id) => id != null && referencedNames.has(id));
+  });
 }

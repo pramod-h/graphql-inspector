@@ -17,7 +17,7 @@ program
   .description(
     'Understand how your frontend actually uses GraphQL — dead queries, duplicates, complexity, schema drift, and overfetch analysis.'
   )
-  .version('0.1.0');
+  .version('0.2.0');
 
 // Shared options. NOTE: options/actions must live on subcommands, never on the
 // root program — a root action + argument silently breaks subcommand option
@@ -61,9 +61,8 @@ program
     impactCommand(target, pathArg, opts)
   );
 
-program
-  .command('types')
-  .description('(roadmap) Generated type usage / unused generated types')
+withOpts(program.command('types').description('Generated type usage / unused generated types'))
+  .option('--generated <globs...>', 'globs for generated files (overrides auto-detection)')
   .action(typesCommand);
 
 program.parseAsync(process.argv).catch((err) => {

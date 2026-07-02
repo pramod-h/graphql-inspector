@@ -1,11 +1,27 @@
 import { describe, it, expect } from 'vitest';
+import path from 'path';
 import { Project } from 'ts-morph';
+import { buildSchema } from 'graphql';
 import { extractTaggedTemplates } from '../src/parsers/graphql-files';
 import { buildModel } from '../src/parsers/operations';
-import { mapComponents } from '../src/analyzers/component-map';
+import { mapComponents, collectReferencedNames } from '../src/analyzers/component-map';
 import { analyzeOverfetch } from '../src/analyzers/overfetch';
 import { findDeadQueries } from '../src/analyzers/dead-queries';
 import { findDuplicates } from '../src/analyzers/duplicates';
+import { analyzeGeneratedTypes } from '../src/analyzers/generated-types';
+import { analyzeComplexity } from '../src/analyzers/complexity';
+import { analyzeSchemaDrift } from '../src/analyzers/schema-drift';
+import { analyzeImpact } from '../src/analyzers/impact';
+import { detectProject } from '../src/parsers/project';
+
+function projectOf(files: Record<string, string>) {
+  const project = new Project({
+    useInMemoryFileSystem: true,
+    compilerOptions: { allowJs: true, jsx: 2 },
+  });
+  for (const [name, text] of Object.entries(files)) project.createSourceFile(name, text);
+  return project;
+}
 
 function analyze(files: Record<string, string>) {
   const project = new Project({
@@ -17,7 +33,8 @@ function analyze(files: Record<string, string>) {
   const { defs, bindings } = extractTaggedTemplates(project, errors);
   const { operations, fragments } = buildModel(defs);
   const usages = mapComponents(project, operations, fragments, bindings);
-  return { operations, fragments, usages, bindings, errors };
+  const referencedNames = collectReferencedNames(project);
+  return { operations, fragments, usages, bindings, referencedNames, errors };
 }
 
 const QUERIES = `
@@ -104,8 +121,8 @@ describe('overfetch analyzer', () => {
 });
 
 describe('dead queries', () => {
-  it('flags operations no component runs', () => {
-    const { operations, fragments, usages, bindings } = analyze({
+  it('flags operations no code references', () => {
+    const { operations, referencedNames } = analyze({
       'queries.ts': QUERIES,
       'UserCard.tsx': `
         import { useQuery } from '@apollo/client';
@@ -113,9 +130,26 @@ describe('dead queries', () => {
         export function UserCard() { const { data } = useQuery(GET_USER); return data; }
       `,
     });
-    const dead = findDeadQueries(operations, fragments, usages, bindings);
+    const dead = findDeadQueries(operations, referencedNames);
     expect(dead.map((o) => o.name)).toContain('GetPosts');
     expect(dead.map((o) => o.name)).not.toContain('GetUser');
+  });
+
+  it('does NOT flag a query used only via a custom wrapper hook or operations-map', () => {
+    const { operations, referencedNames } = analyze({
+      'queries.ts': QUERIES,
+      // GET_USER goes through a custom hook; GET_POSTS is registered in an
+      // operations-map object and consumed by property access elsewhere.
+      'wrapper.ts': `
+        import { GET_USER, GET_POSTS } from './queries';
+        function useCustomerQuery(doc: any) { return doc; }
+        export const ops = { getPosts: GET_POSTS };
+        export function useThings() { return useCustomerQuery(GET_USER); }
+      `,
+    });
+    const dead = findDeadQueries(operations, referencedNames).map((o) => o.name);
+    expect(dead).not.toContain('GetUser'); // via wrapper hook (call arg)
+    expect(dead).not.toContain('GetPosts'); // via operations-map value
   });
 });
 
@@ -134,5 +168,177 @@ describe('duplicates & unused variables', () => {
 
     const c = operations.find((o) => o.name === 'C');
     expect(c?.unusedVariables).toEqual(['unused']);
+  });
+});
+
+describe('generated type usage', () => {
+  it('counts a type reachable via a used Document const as used, flags orphans', () => {
+    const project = projectOf({
+      'x.gql.ts': `
+        export type GetUserQuery = { user: { id: string; name: string } };
+        export type GetUserQueryVariables = { id: string };
+        export type OrphanFragment = { foo: string };
+        export const GetUserDocument = {} as unknown as DocumentNode<GetUserQuery, GetUserQueryVariables>;
+      `,
+      'App.tsx': `
+        import { GetUserDocument } from './x.gql';
+        export function App() { return GetUserDocument; }
+      `,
+    });
+    const report = analyzeGeneratedTypes(project, '/');
+    expect(report.found).toBe(true);
+    expect(report.total).toBe(3);
+    expect(report.unused.map((u) => u.name)).toEqual(['OrphanFragment']);
+    expect(report.used).toBe(2); // GetUserQuery + GetUserQueryVariables via the imported Document
+  });
+
+  it('reports found=false when there is no codegen output', () => {
+    const report = analyzeGeneratedTypes(projectOf({ 'a.ts': 'export const x = 1;' }), '/');
+    expect(report.found).toBe(false);
+  });
+});
+
+describe('complexity', () => {
+  it('rates deep queries high-risk and shallow ones low', () => {
+    const { operations } = analyze({
+      'q.ts': `
+        import { gql } from '@apollo/client';
+        export const DEEP = gql\`query Deep { a { b { c { d { e { f { g { h { i } } } } } } } } }\`;
+        export const FLAT = gql\`query Flat { x y z }\`;
+      `,
+    });
+    const reports = analyzeComplexity(operations);
+    const deep = reports.find((r) => r.operation === 'Deep')!;
+    const flat = reports.find((r) => r.operation === 'Flat')!;
+    expect(deep.depth).toBe(9);
+    expect(deep.risk).toBe('high');
+    expect(flat.risk).toBe('low');
+    expect(reports[0].operation).toBe('Deep'); // sorted by depth desc
+  });
+});
+
+describe('schema drift', () => {
+  const schema = buildSchema(`
+    type Query { user: User }
+    type User { id: ID! name: String }
+  `);
+
+  it('flags requested fields the schema no longer has', () => {
+    const { operations, fragments } = analyze({
+      'q.ts': `
+        import { gql } from '@apollo/client';
+        export const Q = gql\`query Q { user { id name removedField } }\`;
+      `,
+    });
+    const drift = analyzeSchemaDrift(schema, operations, fragments);
+    expect(drift.length).toBeGreaterThan(0);
+    expect(drift[0].message).toMatch(/removedField/);
+  });
+
+  it('reports no drift for a valid operation', () => {
+    const { operations, fragments } = analyze({
+      'q.ts': `
+        import { gql } from '@apollo/client';
+        export const Q = gql\`query Q { user { id name } }\`;
+      `,
+    });
+    expect(analyzeSchemaDrift(schema, operations, fragments)).toHaveLength(0);
+  });
+
+  it('returns nothing when no schema is provided', () => {
+    const { operations, fragments } = analyze({
+      'q.ts': `import { gql } from '@apollo/client'; export const Q = gql\`query Q { anything }\`;`,
+    });
+    expect(analyzeSchemaDrift(null, operations, fragments)).toHaveLength(0);
+  });
+});
+
+describe('impact', () => {
+  it('finds operations and components affected by a field', () => {
+    const { operations, fragments, usages } = analyze({
+      'q.ts': `
+        import { gql } from '@apollo/client';
+        export const GET_PROD = gql\`query GetProd { product { id price name } }\`;
+        export const GET_CAT = gql\`query GetCat { category { id title } }\`;
+      `,
+      'ProductView.tsx': `
+        import { useQuery } from '@apollo/client';
+        import { GET_PROD } from './q';
+        export function ProductView() { const { data } = useQuery(GET_PROD); return data; }
+      `,
+    });
+    const impact = analyzeImpact(operations, fragments, usages, 'Product.price');
+    expect(impact.field).toBe('price');
+    expect(impact.operations).toContain('GetProd');
+    expect(impact.operations).not.toContain('GetCat');
+    expect(impact.components).toContain('ProductView');
+  });
+});
+
+describe('project detection', () => {
+  it('detects client libs and codegen from a real fixture', () => {
+    const root = path.resolve('test/fixtures/detect');
+    const info = detectProject(root);
+    expect(info.detected).toContain('Apollo Client');
+    expect(info.detected).toContain('Next.js');
+    expect(info.hasCodegen).toBe(true);
+  });
+});
+
+describe('urql', () => {
+  it('resolves useQuery({ query }) and flags overfetch (not Apollo mis-parse)', () => {
+    const { operations, fragments, usages, bindings, referencedNames } = analyze({
+      'q.ts': `
+        import { gql } from 'urql';
+        export const GET_USER = gql\`query GetUser { user { id name email } }\`;
+      `,
+      'C.tsx': `
+        import { useQuery } from 'urql';
+        import { GET_USER } from './q';
+        export function C() {
+          const [{ data }] = useQuery({ query: GET_USER });
+          return data?.user?.name;
+        }
+      `,
+    });
+    const f = analyzeOverfetch(operations, fragments, usages, bindings).find(
+      (x) => x.operation === 'GetUser'
+    );
+    expect(f).toBeTruthy();
+    const paths = f!.unused.map((u) => u.path);
+    expect(paths).toContain('user.id');
+    expect(paths).toContain('user.email');
+    expect(paths).not.toContain('user.name');
+    expect(findDeadQueries(operations, referencedNames).map((o) => o.name)).not.toContain(
+      'GetUser'
+    );
+  });
+});
+
+describe('relay', () => {
+  it('resolves an inline graphql`` query in useLazyLoadQuery and flags overfetch', () => {
+    const { operations, fragments, usages, bindings, referencedNames } = analyze({
+      'C.tsx': `
+        import { useLazyLoadQuery, graphql } from 'react-relay';
+        export function C() {
+          const data = useLazyLoadQuery(
+            graphql\`query CScreenQuery { viewer { id name email } }\`,
+            {}
+          );
+          return data?.viewer?.name;
+        }
+      `,
+    });
+    const f = analyzeOverfetch(operations, fragments, usages, bindings).find(
+      (x) => x.operation === 'CScreenQuery'
+    );
+    expect(f).toBeTruthy();
+    const paths = f!.unused.map((u) => u.path);
+    expect(paths).toContain('viewer.id');
+    expect(paths).toContain('viewer.email');
+    expect(paths).not.toContain('viewer.name');
+    expect(findDeadQueries(operations, referencedNames).map((o) => o.name)).not.toContain(
+      'CScreenQuery'
+    );
   });
 });

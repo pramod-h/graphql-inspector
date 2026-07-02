@@ -125,26 +125,28 @@ function classifyCall(
   const gen = /^use([A-Z]\w*?)(LazyQuery|SuspenseQuery|Query|Mutation|Subscription)$/.exec(
     hook
   );
-  if (gen && !APOLLO_HOOKS.has(hook) && !URQL_HOOKS.has(hook)) {
+  // Exclude known client hooks — Relay's useLazyLoadQuery/usePreloadedQuery
+  // otherwise match this regex (use + "LazyLoad" + "Query") and get mislabeled.
+  if (gen && !APOLLO_HOOKS.has(hook) && !URQL_HOOKS.has(hook) && !RELAY_HOOKS.has(hook)) {
     return { library: 'codegen', hook, docArg: null, generatedName: gen[1] };
   }
 
+  // useQuery/useMutation/useSubscription exist in BOTH Apollo and urql. urql
+  // passes `{ query|mutation|document: DOC }`; Apollo passes the DOC directly.
+  // Disambiguate by the first argument's shape before defaulting to Apollo.
+  if (URQL_HOOKS.has(hook) && args[0] && Node.isObjectLiteralExpression(args[0])) {
+    const obj = args[0];
+    const prop =
+      obj.getProperty('query') ?? obj.getProperty('mutation') ?? obj.getProperty('document');
+    const docArg =
+      prop && Node.isPropertyAssignment(prop) ? prop.getInitializer() ?? null : null;
+    return { library: 'urql', hook, docArg, generatedName: null };
+  }
   if (APOLLO_HOOKS.has(hook)) {
     return { library: 'apollo', hook, docArg: args[0] ?? null, generatedName: null };
   }
   if (RELAY_HOOKS.has(hook)) {
     return { library: 'relay', hook, docArg: args[0] ?? null, generatedName: null };
-  }
-  if (URQL_HOOKS.has(hook)) {
-    // urql useQuery({ query: DOC }); useMutation(DOC)
-    let docArg: Node | null = args[0] ?? null;
-    if (docArg && Node.isObjectLiteralExpression(docArg)) {
-      const prop =
-        docArg.getProperty('query') ?? docArg.getProperty('mutation');
-      docArg =
-        prop && Node.isPropertyAssignment(prop) ? prop.getInitializer() ?? null : null;
-    }
-    return { library: 'urql', hook, docArg, generatedName: null };
   }
   if (REQUEST_FNS.has(hook)) {
     // graphql-request: request(url, DOC, variables)
@@ -181,6 +183,25 @@ function docIdentifier(docArg: Node | null): string | null {
   return null;
 }
 
+const GQL_TAG_BASES = new Set(['gql', 'graphql', 'graphqlTag']);
+function isGqlTag(tagText: string): boolean {
+  const base = tagText.split('.')[0].split('(')[0];
+  return GQL_TAG_BASES.has(base) || tagText.endsWith('gql');
+}
+
+/**
+ * Relay commonly inlines the document: `useLazyLoadQuery(graphql`query Foo…`)`
+ * or `useFragment(graphql`fragment Bar…`, ref)`. Pull the operation/fragment
+ * name straight out of the template so it can be resolved by name.
+ */
+function inlineDocName(docArg: Node | null): string | null {
+  if (docArg && Node.isTaggedTemplateExpression(docArg) && isGqlTag(docArg.getTag().getText())) {
+    const m = /(?:query|mutation|subscription|fragment)\s+(\w+)/.exec(docArg.getText());
+    return m ? m[1] : null;
+  }
+  return null;
+}
+
 /** From a hook call, figure out the identifiers that hold the result data. */
 function resultAliases(call: CallExpression, library: Library, hook: string, scope: Node): Alias[] {
   const aliases: Alias[] = [];
@@ -202,9 +223,16 @@ function resultAliases(call: CallExpression, library: Library, hook: string, sco
     } else if (Node.isArrayBindingPattern(nameNode)) {
       const els = nameNode.getElements();
       if (library === 'urql') {
-        // const [{ data }] = useQuery(...)
+        // urql result is the FIRST tuple element: const [{ data }] = useQuery()
+        // or const [result] = useQuery() → result.data.<field>
         const first = els[0];
-        if (first && Node.isBindingElement(first)) pushObjData(first.getNameNode());
+        if (first && Node.isBindingElement(first)) {
+          const nn = first.getNameNode();
+          if (Node.isObjectBindingPattern(nn)) pushObjData(nn);
+          else if (Node.isIdentifier(nn)) {
+            aliases.push({ ident: nn.getText(), base: '', scope, viaData: true });
+          }
+        }
       } else {
         // Apollo mutation: const [mutate, { data }] = useMutation(...)
         const second = els[1];
@@ -425,6 +453,60 @@ function collectAccesses(
   }
 }
 
+const GENERATED_HOOK_RE = /^use([A-Z]\w*?)(LazyQuery|SuspenseQuery|Query|Mutation|Subscription)$/;
+
+/**
+ * Every identifier referenced as a *value* across the project (call arguments,
+ * object-literal values, named imports) plus generated-hook operation names.
+ *
+ * This deliberately over-collects: it's the signal for "this GraphQL document
+ * is used *somewhere*", even through custom wrapper hooks, Venia operations-map
+ * objects, or duplicate definitions that share a name. Declaration name nodes
+ * are never in these positions, so an identifier here always means a reference.
+ */
+export function collectReferencedNames(project: Project): Set<string> {
+  const names = new Set<string>();
+  const add = (t?: string | null) => {
+    if (t) names.add(t);
+  };
+
+  for (const sf of project.getSourceFiles()) {
+    for (const imp of sf.getImportDeclarations()) {
+      for (const ni of imp.getNamedImports()) add(ni.getNameNode().getText());
+    }
+    for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const callee = call.getExpression();
+      const hookName = Node.isIdentifier(callee)
+        ? callee.getText()
+        : Node.isPropertyAccessExpression(callee)
+        ? callee.getName()
+        : '';
+      const gen = GENERATED_HOOK_RE.exec(hookName);
+      if (gen) add(gen[1]); // useGetUserQuery → GetUser
+      for (const arg of call.getArguments()) {
+        if (Node.isIdentifier(arg)) add(arg.getText());
+        else if (Node.isObjectLiteralExpression(arg)) {
+          for (const p of arg.getProperties()) {
+            if (Node.isPropertyAssignment(p)) {
+              const init = p.getInitializer();
+              if (init && Node.isIdentifier(init)) add(init.getText());
+            }
+          }
+        } else {
+          // Inline documents: useLazyLoadQuery(graphql`query Foo…`) (Relay).
+          add(inlineDocName(arg));
+        }
+      }
+    }
+    // Operation-map objects: `{ getFooData: GET_FOO }` (Venia mergeOperations pattern).
+    for (const pa of sf.getDescendantsOfKind(SyntaxKind.PropertyAssignment)) {
+      const init = pa.getInitializer();
+      if (init && Node.isIdentifier(init)) add(init.getText());
+    }
+  }
+  return names;
+}
+
 /** Build the operation/fragment → component usage map for the whole project. */
 export function mapComponents(
   project: Project,
@@ -442,10 +524,10 @@ export function mapComponents(
       if (!classified) continue;
       const { library, hook, docArg, generatedName } = classified;
 
-      const identifier = generatedName ?? docIdentifier(docArg);
+      const identifier = generatedName ?? docIdentifier(docArg) ?? inlineDocName(docArg);
       const isFragmentHook = hook === 'useFragment';
-      const op = isFragmentHook ? null : resolveOp(generatedName ?? docIdentifier(docArg));
-      const frag = isFragmentHook ? resolveFrag(docIdentifier(docArg)) : null;
+      const op = isFragmentHook ? null : resolveOp(identifier);
+      const frag = isFragmentHook ? resolveFrag(identifier) : null;
 
       const operationName = op?.name ?? frag?.name ?? generatedName ?? identifier ?? null;
 

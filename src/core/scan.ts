@@ -8,8 +8,9 @@ import {
   extractGraphqlFiles,
   extractTaggedTemplates,
 } from '../parsers/graphql-files';
-import { mapComponents } from '../analyzers/component-map';
+import { mapComponents, collectReferencedNames } from '../analyzers/component-map';
 import { runAnalysis } from '../analyzers';
+import { analyzeGeneratedTypes } from '../analyzers/generated-types';
 import { spinner } from '../utils/logger';
 
 export interface ScanResult {
@@ -56,6 +57,7 @@ export function scan(options: ScanOptions): ScanResult {
 
   sp.text = 'Mapping components → operations…';
   const usages = mapComponents(tsProject, operations, fragments, bindings);
+  const referencedNames = collectReferencedNames(tsProject);
   const components = new Set(usages.map((u) => `${u.file}:${u.component}`)).size;
 
   sp.text = 'Running analyzers…';
@@ -65,6 +67,7 @@ export function scan(options: ScanOptions): ScanResult {
     fragments,
     usages,
     bindings,
+    referencedNames,
     schema,
     stats: {
       graphqlFiles: fileDefs.length,
@@ -72,6 +75,11 @@ export function scan(options: ScanOptions): ScanResult {
       components,
     },
   });
+
+  if (options.analyzeTypes) {
+    sp.text = 'Analyzing generated types…';
+    analysis.generatedTypes = analyzeGeneratedTypes(tsProject, root, options.generated);
+  }
 
   sp.succeed('Analysis complete');
   return { analysis, parseErrors };
