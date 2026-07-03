@@ -1,5 +1,5 @@
 {
-  "name": "@codilar/graphql-inspector",
+  "name": "@pramod_sh/graphql-inspector",
   "version": "0.2.0",
   "description": "Understand how your frontend actually uses GraphQL — dead queries, duplicates, complexity, schema drift, and overfetch analysis across GraphQL ↔ hooks ↔ React components.",
   "keywords": [
@@ -15,7 +15,10 @@
     "dead-code"
   ],
   "license": "MIT",
-  "author": "Codilar",
+  "author": "Pramod H",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -25,7 +28,9 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18"

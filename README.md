@@ -1,4 +1,4 @@
-# @codilar/graphql-inspector
+# @pramod_sh/graphql-inspector
 
 > Understand how your frontend **actually uses** GraphQL.
 
@@ -18,8 +18,8 @@ and surfaces things the existing tooling can't:
 Zero config. No server. No account. Runs locally.
 
 ```bash
-npx @codilar/graphql-inspector            # summary for the current directory
-npx @codilar/graphql-inspector --details  # every section
+npx @pramod_sh/graphql-inspector            # summary for the current directory
+npx @pramod_sh/graphql-inspector --details  # every section
 ```
 
 ## Commands
@@ -94,7 +94,7 @@ crying wolf — but be aware:
 ## Programmatic use
 
 ```ts
-import { scan } from '@codilar/graphql-inspector';
+import { scan } from '@pramod_sh/graphql-inspector';
 const { analysis } = scan({ cwd: process.cwd() });
 console.log(analysis.overfetch);
 ```

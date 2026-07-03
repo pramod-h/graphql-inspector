@@ -1,7 +1,7 @@
 /**
- * Programmatic API for @codilar/graphql-inspector.
+ * Programmatic API for @pramod_sh/graphql-inspector.
  *
- *   import { scan } from '@codilar/graphql-inspector';
+ *   import { scan } from '@pramod_sh/graphql-inspector';
  *   const { analysis } = scan({ cwd: process.cwd() });
  */
 export { scan } from './core/scan';
