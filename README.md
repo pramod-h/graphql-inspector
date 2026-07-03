@@ -1,42 +1,118 @@
-# @pramod_sh/graphql-inspector
+# GraphQL Inspector — Detect GraphQL Overfetching, Dead Queries & Unused Fields in React Apps
 
-> Understand how your frontend **actually uses** GraphQL.
+[![npm version](https://img.shields.io/npm/v/@pramod_sh/graphql-inspector.svg)](https://www.npmjs.com/package/@pramod_sh/graphql-inspector)
+[![npm downloads](https://img.shields.io/npm/dm/@pramod_sh/graphql-inspector.svg)](https://www.npmjs.com/package/@pramod_sh/graphql-inspector)
+[![license: MIT](https://img.shields.io/npm/l/@pramod_sh/graphql-inspector.svg)](./LICENSE)
+[![node](https://img.shields.io/node/v/@pramod_sh/graphql-inspector.svg)](https://www.npmjs.com/package/@pramod_sh/graphql-inspector)
 
-Not another linter, code generator, or schema validator. This tool analyzes the
-relationship between **GraphQL operations → hooks → React components → the UI**,
-and surfaces things the existing tooling can't:
+**GraphQL Inspector** is a zero-config, static-analysis CLI that shows you how your
+frontend **actually uses GraphQL** — not just what your schema or documents look
+like. It traces the full chain **GraphQL operation → hook → React component → UI**
+to find overfetching, dead queries, dead fragments, duplicate documents, unused
+Code Generator types, risky query complexity, and schema drift. It runs entirely
+on your machine: no server, no account, no code leaves your computer.
+
+Works with **Apollo Client**, **urql**, **Relay**, and **graphql-request**, in
+**React**, **Next.js**, TypeScript, and plain JavaScript projects.
+
+```bash
+npx @pramod_sh/graphql-inspector            # summary report for the current directory
+```
+
+## Table of contents
+
+- [Why GraphQL Inspector](#why-graphql-inspector)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Commands](#commands)
+- [Flags](#flags)
+- [What it detects](#what-it-detects)
+- [Supported libraries & patterns](#supported-libraries--patterns)
+- [How overfetch detection works (and its limits)](#how-overfetch-detection-works-and-its-limits)
+- [FAQ](#faq)
+- [Known limitations](#known-limitations)
+- [Programmatic use](#programmatic-use)
+- [Development](#development)
+
+## Why GraphQL Inspector
+
+Most GraphQL tooling — linters, codegen, schema validators — checks whether your
+**documents are well-formed**. None of it tells you whether the **fields you're
+fetching are actually read by the component that requested them**. That gap is
+where overfetching lives, and it's invisible to every other tool in the
+ecosystem:
 
 - **Overfetching** — fields a query requests but the component never reads. ⭐
+  The differentiator: no other open-source tool traces field reads all the way
+  from a GraphQL document, through hooks and custom talons, into JSX.
 - **Dead queries** — operations no component executes.
 - **Dead fragments** — fragments never spread anywhere.
-- **Duplicate & near-duplicate** documents (e.g. `SearchProducts` vs `ProductSearch`, 98% identical).
+- **Duplicate & near-duplicate documents** (e.g. `SearchProducts` vs
+  `ProductSearch`, 98% identical).
 - **Query complexity** — depth and field-count risk.
 - **Schema drift** — requested fields that no longer exist in the schema.
 - **Unused variables** — declared operation variables never referenced.
-- **Impact** — the blast radius of a field across operations, fragments, and components.
+- **Impact analysis** — the blast radius of a schema field across operations,
+  fragments, and components (useful before a breaking schema change).
+- **Unused GraphQL Code Generator types** — generated types your app never
+  imports.
 
-Zero config. No server. No account. Runs locally.
+## Install
+
+No install required — run it with `npx`:
 
 ```bash
-npx @pramod_sh/graphql-inspector            # summary for the current directory
-npx @pramod_sh/graphql-inspector --details  # every section
+npx @pramod_sh/graphql-inspector
+```
+
+Or add it as a dev dependency for repeatable CI runs (it's a dev-time analysis
+tool, not a runtime dependency of your app):
+
+```bash
+npm install --save-dev @pramod_sh/graphql-inspector
+# or
+yarn add -D @pramod_sh/graphql-inspector
+```
+
+## Quick start
+
+```bash
+npx @pramod_sh/graphql-inspector            # full summary for the current directory
+npx @pramod_sh/graphql-inspector --details  # every section, expanded
+```
+
+Once installed, both `graphql-inspector` and the short alias `gqi` are
+available:
+
+```bash
+npx gqi overfetch ./src --schema ./schema.graphql
 ```
 
 ## Commands
 
-```bash
-graphql-inspector [path]                 # full report (add --details)
-graphql-inspector overfetch [path]       # the differentiator ⭐
-graphql-inspector unused [path]          # dead queries + fragments + variables
-graphql-inspector complexity [path]      # depth / field-count risk
-graphql-inspector duplicates [path]      # identical & near-identical docs
-graphql-inspector impact <Type.field>    # affected operations/fragments/components
-graphql-inspector types [path]           # unused GraphQL Code Generator types
-```
+| Command | What it reports |
+|---|---|
+| `graphql-inspector [path]` | Full report across every analyzer (add `--details`) |
+| `graphql-inspector overfetch [path]` | ⭐ Fields requested but never read in components |
+| `graphql-inspector unused [path]` | Dead queries, dead fragments, unused variables |
+| `graphql-inspector complexity [path]` | Query depth / field-count risk |
+| `graphql-inspector duplicates [path]` | Identical & near-identical documents |
+| `graphql-inspector impact <Type.field>` | Affected operations, fragments, and components for a schema field |
+| `graphql-inspector types [path]` | Unused GraphQL Code Generator types |
 
-Flags: `--json` (machine-readable), `--schema <path>` (SDL or introspection JSON,
-enables schema-drift), `--ignore <globs...>`. `types` also takes
-`--generated <globs...>` to point at codegen output when auto-detection misses it.
+`[path]` defaults to the current directory. `gqi` is a drop-in short alias for
+`graphql-inspector` — every command above works identically with `gqi` in
+place of `graphql-inspector`.
+
+## Flags
+
+| Flag | Applies to | Description |
+|---|---|---|
+| `--details` | root report | Expand every section instead of just the summary |
+| `--json` | all commands | Machine-readable output, e.g. for CI or piping into `jq` |
+| `--schema <path>` | all commands | SDL or introspection JSON; enables schema-drift detection |
+| `--ignore <globs...>` | all commands | Exclude paths (`node_modules`, generated files, tests, …) |
+| `--generated <globs...>` | `types` only | Point at codegen output when auto-detection misses it |
 
 ## What it understands
 
@@ -44,17 +120,20 @@ enables schema-drift), `--ignore <globs...>`. `types` also takes
 |---|---|
 | `.graphql` / `.gql` files + GraphQL Code Generator | ✅ (resolves `FooDocument` → operation `Foo`) |
 | `gql\`\`` / `graphql\`\`` tagged templates | ✅ (incl. `${Fragment}` interpolation) |
-| Apollo Client (`useQuery`, `useMutation`, `useSuspenseQuery`, `useFragment`, …) | ✅ |
-| urql (`useQuery({ query })`, `useMutation`) | ✅ |
+| Apollo Client hooks (`useQuery`, `useMutation`, `useSuspenseQuery`, `useFragment`, …) | ✅ |
+| Apollo Client imperative API (`client.query({ query })`, `client.mutate({ mutation })`, incl. `.then()` chaining) | ✅ |
+| urql (`useQuery({ query })`, `useMutation`, imperative `client.query`) | ✅ |
 | graphql-request (`request(url, DOC)`) | ✅ |
 | Relay (`useLazyLoadQuery`, `useFragment`) | ✅ |
 | TypeScript **and** plain JS/JSX | ✅ |
 
 Field-read tracing handles optional chaining (`data?.a?.b`), destructuring
-(incl. renamed `{ data: alias }`), `.map()/.filter()` callbacks, `onCompleted`
-callbacks, local re-aliasing, and pass-through (objects handed to a child
-component or returned from a custom hook are treated as **used**, so custom-hook
-indirection doesn't produce false positives).
+(incl. renamed and nested defaults like `const { data: { user } = {} } = ...`),
+`.map()`/`.filter()`/`.reduce()` callbacks, `onCompleted`/`onData` callbacks,
+local re-aliasing, and pass-through (an object handed to a child component,
+returned from a custom hook, or spread into page props is treated as
+**used**, so custom-hook indirection and SSR prop drilling don't produce false
+positives).
 
 ## How overfetch detection works (and its limits)
 
@@ -64,32 +143,71 @@ set, then compares it against every field read in the components that run it.
 - It is **precision-biased**: if it can't observe any field reads for a query
   (e.g. the result is only returned from a hook it can't follow), it reports
   nothing for that query rather than claiming everything is unused.
-- Confidence is labeled: **high** = a whole top-level field is never referenced;
-  **medium** = sibling fields are read but this one isn't.
+- Confidence is labeled: **high** = a whole top-level field is never
+  referenced; **medium** = sibling fields are read but this one isn't.
 
-This is a static heuristic, not a proof — review findings before deleting fields.
+This is a static heuristic, not a proof — review findings before deleting
+fields.
 
-## Known limitations (v0.1)
+## FAQ
+
+**What is GraphQL overfetching, and why does it matter?**
+Overfetching is when a query requests fields the UI never actually renders —
+extra payload, extra parsing, extra bandwidth, with zero user-facing benefit.
+It's invisible to schema validators and linters because the query is
+perfectly valid GraphQL; you only see it by cross-referencing the query
+against how the *component* consumes the result, which is exactly what
+`graphql-inspector overfetch` does.
+
+**Does this replace ESLint / `graphql-eslint` / GraphQL Code Generator?**
+No — those validate document syntax and generate types. GraphQL Inspector is
+complementary: it analyzes runtime *usage* (which fields are actually read),
+a dimension none of those tools cover.
+
+**Does it work with Next.js?**
+Yes, including server-side data fetching that uses Apollo Client's imperative
+`client.query()`/`client.mutate()` API (common in `getServerSideProps` /
+route handlers), not just React hooks.
+
+**Do I need a GraphQL server or schema file to run it?**
+No. Most analyzers (overfetch, dead queries, duplicates, complexity) work
+purely from your source code. Only schema-drift detection needs `--schema`.
+
+**Is it safe to run in CI? Does any code leave my machine?**
+Yes — it's a local static-analysis CLI. No network calls, no account, no code
+or schema is ever uploaded anywhere.
+
+**Why do some fields I know are used still show up as overfetched?**
+The tracer is precision-biased but not perfect — see
+[Known limitations](#known-limitations) below for patterns (e.g. React
+Context, Redux, deeply indirect custom hooks) it can't yet see through.
+Treat findings as a strong signal to review, not an automatic delete list.
+
+## Known limitations (v0.2)
 
 This is a static heuristic. Where it can't see something, it errs toward *not*
 crying wolf — but be aware:
 
-- **Overfetch** doesn't follow reads across module boundaries or through custom
-  hooks that return `data` (Venia "talons", etc.). It treats data returned/passed
-  onward as *used*, so those show as fully used rather than false overfetch.
+- **Overfetch** doesn't follow reads through **React Context**
+  (`createContext`/`useContext`), Redux/global state, or a custom hook defined
+  in another file that isn't itself the `useQuery`/`client.query` call site.
+  It only traces the scope immediately around the query execution, plus
+  simple pass-through (return, JSX, spread, object literal) within that same
+  scope.
 - **Dead queries** are detected by whether the document's identifier is
   referenced anywhere as a value (hook call, wrapper hook, operations-map,
   named import, generated hook). This handles custom-hook indirection and
   duplicate definitions, and is precision-biased — it won't call a query dead
   just because the exact hook couldn't be traced (so it may under-report).
-- **Dead fragments** use spread-reachability from operations. A fragment spread
-  only by a fragment defined in `node_modules` / another package can still show
-  as dead — confirm before deleting.
-- **Schema drift** requires an accurate, current schema (`--schema`). A stale or
-  partial snapshot will produce noise.
-- **Generated type usage** counts a type as used if it's reachable from app-code
-  imports/type-references (following references between generated types). Types
-  reached only via `export *` barrels or dynamic access may show as unused.
+- **Dead fragments** use spread-reachability from operations. A fragment
+  spread only by a fragment defined in `node_modules` / another package can
+  still show as dead — confirm before deleting.
+- **Schema drift** requires an accurate, current schema (`--schema`). A stale
+  or partial snapshot will produce noise.
+- **Generated type usage** counts a type as used if it's reachable from
+  app-code imports/type-references (following references between generated
+  types). Types reached only via `export *` barrels or dynamic access may
+  show as unused.
 
 ## Programmatic use
 
@@ -106,6 +224,8 @@ console.log(analysis.overfetch);
 ## Development
 
 ```bash
+git clone https://github.com/pramod-h/graphql-inspector.git
+cd graphql-inspector
 yarn install
 yarn dev overfetch ../some-graphql-project   # run from source
 yarn build && yarn test
@@ -113,4 +233,4 @@ yarn build && yarn test
 
 ## License
 
-MIT
+MIT © [Pramod H](https://github.com/pramod-h)

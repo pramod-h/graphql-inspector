@@ -23,6 +23,16 @@ const APOLLO_HOOKS = new Set([
 const URQL_HOOKS = new Set(['useQuery', 'useMutation', 'useSubscription']);
 const REQUEST_FNS = new Set(['request', 'rawRequest']);
 const RELAY_HOOKS = new Set(['useLazyLoadQuery', 'usePreloadedQuery', 'useFragment']);
+/**
+ * Apollo Client's imperative API: `client.query({ query: DOC })` /
+ * `client.mutate({ mutation: DOC })`. Common in SSR/server-side data fetching
+ * where hooks aren't available. Maps the method name to the options key that
+ * carries the document.
+ */
+const APOLLO_CLIENT_METHOD_KEYS: Record<string, 'query' | 'mutation'> = {
+  query: 'query',
+  mutate: 'mutation',
+};
 
 /** Iteration methods whose callback's element param aliases a list element. */
 const CB_ELEMENT_METHODS = new Set([
@@ -121,6 +131,22 @@ function classifyCall(
     : callee.getText();
   const args = call.getArguments();
 
+  // Apollo Client's imperative API: client.query({ query: DOC }) / client.mutate({ mutation: DOC }).
+  const clientOptKey = APOLLO_CLIENT_METHOD_KEYS[hook];
+  if (
+    clientOptKey &&
+    Node.isPropertyAccessExpression(callee) &&
+    args[0] &&
+    Node.isObjectLiteralExpression(args[0])
+  ) {
+    const obj = args[0];
+    const prop = obj.getProperty(clientOptKey);
+    const docArg = prop && Node.isPropertyAssignment(prop) ? prop.getInitializer() ?? null : null;
+    if (docArg) {
+      return { library: 'apollo', hook: `client.${hook}`, docArg, generatedName: null };
+    }
+  }
+
   // Codegen-generated hooks embed the document: use<Name>Query / ...Mutation / etc.
   const gen = /^use([A-Z]\w*?)(LazyQuery|SuspenseQuery|Query|Mutation|Subscription)$/.exec(
     hook
@@ -202,23 +228,49 @@ function inlineDocName(docArg: Node | null): string | null {
   return null;
 }
 
+/**
+ * Recursively resolve a binding name — a plain identifier, or a (possibly
+ * nested, possibly defaulted) object pattern — into alias entries rooted at
+ * `base`. Needed because `BindingElement.getName()` returns the pattern's raw
+ * source text (e.g. `"{ storeConfig }"`) rather than a usable identifier when
+ * the binding is nested, silently dropping extremely common Apollo code like
+ * `const { data: { storeConfig } = {} } = useQuery(...)`.
+ */
+function bindNamePattern(nameNode: Node, base: string, scope: Node, aliases: Alias[]): void {
+  if (Node.isIdentifier(nameNode)) {
+    aliases.push({ ident: nameNode.getText(), base, scope });
+    return;
+  }
+  if (Node.isObjectBindingPattern(nameNode)) {
+    for (const el of nameNode.getElements()) {
+      if (el.getDotDotDotToken()) continue; // rest element — not a single field path
+      const elNameNode = el.getNameNode();
+      const prop =
+        el.getPropertyNameNode()?.getText() ??
+        (Node.isIdentifier(elNameNode) ? elNameNode.getText() : undefined);
+      if (prop === undefined) continue;
+      bindNamePattern(elNameNode, base ? `${base}.${prop}` : prop, scope, aliases);
+    }
+  }
+}
+
 /** From a hook call, figure out the identifiers that hold the result data. */
 function resultAliases(call: CallExpression, library: Library, hook: string, scope: Node): Alias[] {
   const aliases: Alias[] = [];
   const decl = call.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
   const nameNode = decl?.getNameNode();
 
-  const pushObjData = (objPattern: Node) => {
+  const pushObjData = (objPattern: Node, altScope?: Node) => {
     if (!Node.isObjectBindingPattern(objPattern)) return;
     for (const el of objPattern.getElements()) {
       const prop = el.getPropertyNameNode()?.getText() ?? el.getName();
-      if (prop === 'data') aliases.push({ ident: el.getName(), base: '', scope });
+      if (prop === 'data') bindNamePattern(el.getNameNode(), '', altScope ?? scope, aliases);
     }
   };
 
   if (nameNode) {
     if (Node.isObjectBindingPattern(nameNode)) {
-      // Apollo: const { data } = useQuery(...)  /  const { data: alias } = ...
+      // Apollo: const { data } = useQuery(...)  /  const { data: { user } = {} } = ...
       pushObjData(nameNode);
     } else if (Node.isArrayBindingPattern(nameNode)) {
       const els = nameNode.getElements();
@@ -267,6 +319,28 @@ function resultAliases(call: CallExpression, library: Library, hook: string, sco
     }
   }
 
+  // Promise chaining on imperative calls: client.query(opts).then(({ data }) => ...)
+  // or .then((result) => result.data...).
+  const thenAccess = call.getParent();
+  if (Node.isPropertyAccessExpression(thenAccess) && thenAccess.getName() === 'then') {
+    const thenCall = thenAccess.getParent();
+    if (Node.isCallExpression(thenCall) && thenCall.getExpression() === thenAccess) {
+      const cb = thenCall.getArguments()[0];
+      if (cb && (Node.isArrowFunction(cb) || Node.isFunctionExpression(cb))) {
+        const p0 = cb.getParameters()[0];
+        if (p0) {
+          const pn = p0.getNameNode();
+          const body = cb.getBody();
+          if (Node.isIdentifier(pn)) {
+            aliases.push({ ident: pn.getText(), base: '', scope: body, viaData: true });
+          } else if (Node.isObjectBindingPattern(pn)) {
+            pushObjData(pn, body);
+          }
+        }
+      }
+    }
+  }
+
   return aliases;
 }
 
@@ -294,8 +368,13 @@ function bindCallbackParams(
       queue.push({ ident: pn.getText(), base, scope: body });
     } else if (Node.isObjectBindingPattern(pn)) {
       for (const el of pn.getElements()) {
-        const prop = el.getPropertyNameNode()?.getText() ?? el.getName();
-        queue.push({ ident: el.getName(), base: base ? `${base}.${prop}` : prop, scope: body });
+        if (el.getDotDotDotToken()) continue;
+        const elNameNode = el.getNameNode();
+        const prop =
+          el.getPropertyNameNode()?.getText() ??
+          (Node.isIdentifier(elNameNode) ? elNameNode.getText() : undefined);
+        if (prop === undefined) continue;
+        bindNamePattern(elNameNode, base ? `${base}.${prop}` : prop, body, queue);
       }
     }
   }
@@ -431,24 +510,28 @@ function collectAccesses(
         queue.push({ ident: bn.getText(), base: curPath, scope: alias.scope });
       } else if (Node.isObjectBindingPattern(bn)) {
         for (const el of bn.getElements()) {
-          const prop = el.getPropertyNameNode()?.getText() ?? el.getName();
-          queue.push({
-            ident: el.getName(),
-            base: curPath ? `${curPath}.${prop}` : prop,
-            scope: alias.scope,
-          });
+          if (el.getDotDotDotToken()) continue;
+          const elNameNode = el.getNameNode();
+          const prop =
+            el.getPropertyNameNode()?.getText() ??
+            (Node.isIdentifier(elNameNode) ? elNameNode.getText() : undefined);
+          if (prop === undefined) continue;
+          bindNamePattern(elNameNode, curPath ? `${curPath}.${prop}` : prop, alias.scope, queue);
         }
       }
       if (curPath) accessed.add(curPath);
       continue;
     }
 
-    if (curPath) {
+    // Handed off as a whole object/subtree → treat it as used. `curPath` may
+    // legitimately be '' here (the entire operation result passed on wholesale,
+    // e.g. `return { storeConfig: data }`) — must not be dropped just because
+    // '' is falsy.
+    if (endParent && WHOLE_OBJECT_PARENTS.has(endParent.getKind())) {
+      passthrough.add(curPath);
+      if (curPath) accessed.add(curPath);
+    } else if (curPath) {
       accessed.add(curPath);
-      // Handed off as a whole object → treat its whole subtree as used.
-      if (endParent && WHOLE_OBJECT_PARENTS.has(endParent.getKind())) {
-        passthrough.add(curPath);
-      }
     }
   }
 }

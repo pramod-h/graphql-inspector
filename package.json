@@ -1,21 +1,39 @@
 {
   "name": "@pramod_sh/graphql-inspector",
   "version": "0.2.0",
-  "description": "Understand how your frontend actually uses GraphQL — dead queries, duplicates, complexity, schema drift, and overfetch analysis across GraphQL ↔ hooks ↔ React components.",
+  "description": "GraphQL static analysis CLI for React apps: detect overfetching, dead queries, dead fragments, duplicate documents, unused Code Generator types, query complexity, and schema drift across Apollo Client, urql, Relay, and graphql-request.",
   "keywords": [
     "graphql",
+    "graphql-inspector",
     "overfetch",
+    "overfetching",
     "static-analysis",
     "apollo",
+    "apollo-client",
     "urql",
     "relay",
+    "graphql-request",
+    "graphql-code-generator",
     "codegen",
     "react",
+    "nextjs",
     "cli",
-    "dead-code"
+    "dead-code",
+    "dead-query",
+    "unused-fields",
+    "schema-drift",
+    "graphql-cli"
   ],
   "license": "MIT",
   "author": "Pramod H",
+  "homepage": "https://github.com/pramod-h/graphql-inspector#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pramod-h/graphql-inspector.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pramod-h/graphql-inspector/issues"
+  },
   "publishConfig": {
     "access": "public"
   },

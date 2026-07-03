@@ -315,6 +315,103 @@ describe('urql', () => {
   });
 });
 
+describe('Apollo Client imperative API', () => {
+  it('resolves client.query({ query }) awaited + destructured, flags overfetch', () => {
+    const { operations, fragments, usages, bindings } = analyze({
+      'q.ts': `
+        import { gql } from '@apollo/client';
+        export const GET_STORE_CONFIG = gql\`query storeConfig { storeConfig { id base_url amxnotif_stock_placeholder } }\`;
+      `,
+      'service.ts': `
+        import { GET_STORE_CONFIG } from './q';
+        export async function fetchPageData(client) {
+          const { data } = await client.query({ query: GET_STORE_CONFIG });
+          return data?.storeConfig?.id;
+        }
+      `,
+    });
+    const f = analyzeOverfetch(operations, fragments, usages, bindings).find(
+      (x) => x.operation === 'storeConfig'
+    );
+    expect(f).toBeTruthy();
+    const paths = f!.unused.map((u) => u.path);
+    expect(paths).toContain('storeConfig.base_url');
+    expect(paths).toContain('storeConfig.amxnotif_stock_placeholder');
+    expect(paths).not.toContain('storeConfig.id');
+  });
+
+  it('does NOT flag fields when the whole result is passed through wholesale (SSR props hand-off)', () => {
+    const { operations, fragments, usages, bindings } = analyze({
+      'q.ts': `
+        import { gql } from '@apollo/client';
+        export const GET_STORE_CONFIG = gql\`query storeConfig { storeConfig { id base_url amxnotif_stock_placeholder } }\`;
+      `,
+      'service.ts': `
+        import { GET_STORE_CONFIG } from './q';
+        export async function fetchPageData(client) {
+          const { data } = await client.query({ query: GET_STORE_CONFIG });
+          return { category: null, storeConfig: data, token: 'x' };
+        }
+      `,
+    });
+    // The whole query result is handed off as a page-props value (\`storeConfig: data\`)
+    // — this is a real passthrough and must not be reported as 100% overfetch.
+    expect(analyzeOverfetch(operations, fragments, usages, bindings).find(
+      (x) => x.operation === 'storeConfig'
+    )).toBeFalsy();
+  });
+
+  it('resolves client.query(...).then(({ data }) => ...) promise chaining', () => {
+    const { operations, fragments, usages, bindings } = analyze({
+      'q.ts': `
+        import { gql } from '@apollo/client';
+        export const GET_USER = gql\`query GetUser { user { id name email } }\`;
+      `,
+      'service.ts': `
+        import { GET_USER } from './q';
+        export function loadUser(client) {
+          return client.query({ query: GET_USER }).then(({ data }) => data?.user?.name);
+        }
+      `,
+    });
+    const f = analyzeOverfetch(operations, fragments, usages, bindings).find(
+      (x) => x.operation === 'GetUser'
+    );
+    expect(f).toBeTruthy();
+    const paths = f!.unused.map((u) => u.path);
+    expect(paths).toContain('user.id');
+    expect(paths).toContain('user.email');
+    expect(paths).not.toContain('user.name');
+  });
+});
+
+describe('nested destructuring with defaults', () => {
+  it('traces reads through `const { data: { storeConfig } = {} } = useQuery(...)`', () => {
+    const { operations, fragments, usages, bindings } = analyze({
+      'q.ts': `
+        import { gql } from '@apollo/client';
+        export const GET_STORE_CONFIG = gql\`query storeConfig { storeConfig { id base_url amxnotif_stock_placeholder } }\`;
+      `,
+      'Comp.tsx': `
+        import { useQuery } from '@apollo/client';
+        import { GET_STORE_CONFIG } from './q';
+        export function Comp() {
+          const { data: { storeConfig } = {} } = useQuery(GET_STORE_CONFIG);
+          return storeConfig?.amxnotif_stock_placeholder ? null : storeConfig?.id;
+        }
+      `,
+    });
+    const f = analyzeOverfetch(operations, fragments, usages, bindings).find(
+      (x) => x.operation === 'storeConfig'
+    );
+    expect(f).toBeTruthy();
+    const paths = f!.unused.map((u) => u.path);
+    expect(paths).toContain('storeConfig.base_url');
+    expect(paths).not.toContain('storeConfig.id');
+    expect(paths).not.toContain('storeConfig.amxnotif_stock_placeholder');
+  });
+});
+
 describe('relay', () => {
   it('resolves an inline graphql`` query in useLazyLoadQuery and flags overfetch', () => {
     const { operations, fragments, usages, bindings, referencedNames } = analyze({

@@ -10,6 +10,7 @@ import { buildResolvers } from './component-map';
 
 /** True if `leaf` is covered by any pass-through (whole-object) ancestor. */
 function passthroughCovers(leaf: string, passthrough: Set<string>): boolean {
+  if (passthrough.has('')) return true; // '' = the entire operation result passed through
   for (const p of passthrough) {
     if (leaf === p || leaf.startsWith(p + '.')) return true;
   }
@@ -19,6 +20,7 @@ function passthroughCovers(leaf: string, passthrough: Set<string>): boolean {
 /** True if any accessed/passthrough path touches the subtree rooted at `top`. */
 function subtreeTouched(top: string, sets: Set<string>[]): boolean {
   for (const set of sets) {
+    if (set.has('')) return true; // '' = the entire operation result passed through
     for (const a of set) {
       if (a === top || a.startsWith(top + '.')) return true;
     }
